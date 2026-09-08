@@ -1,0 +1,199 @@
+name: Build signed BeraTalk Android from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - "BeraTalk*.zip"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.6
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.6.0"
+
+      - name: Locate BeraTalk Android project
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_beratalk_project() {
+            local dir="$1"
+            local gradle_file=""
+            if [[ -f "$dir/app/build.gradle.kts" ]]; then
+              gradle_file="$dir/app/build.gradle.kts"
+            elif [[ -f "$dir/app/build.gradle" ]]; then
+              gradle_file="$dir/app/build.gradle"
+            else
+              return 1
+            fi
+            grep -Eq 'com\.beratalk\.app' "$gradle_file"
+          }
+
+          PROJECT_DIR=""
+
+          # Works if the Android project was uploaded/extracted directly.
+          while IFS= read -r settings_file; do
+            [[ -n "$settings_file" ]] || continue
+            candidate_dir="$(cd "$(dirname "$settings_file")" && pwd)"
+            if is_beratalk_project "$candidate_dir"; then
+              PROJECT_DIR="$candidate_dir"
+              echo "Found extracted BeraTalk project: $PROJECT_DIR"
+              break
+            fi
+          done < <(find . -maxdepth 7 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print | sort)
+
+          # Works if you followed the Prepwise pattern and uploaded only a source ZIP + workflow.
+          if [[ -z "$PROJECT_DIR" ]]; then
+            EXTRACT_ROOT="$RUNNER_TEMP/beratalk-source"
+            rm -rf "$EXTRACT_ROOT"
+            mkdir -p "$EXTRACT_ROOT"
+
+            ZIP_CANDIDATES_FILE="$RUNNER_TEMP/beratalk-zip-candidates.txt"
+            : > "$ZIP_CANDIDATES_FILE"
+            if [[ -f "./BeraTalk-AI-Spark-UXFIX-source.zip" ]]; then
+              printf '%s\n' "./BeraTalk-AI-Spark-UXFIX-source.zip" >> "$ZIP_CANDIDATES_FILE"
+            fi
+            find . -maxdepth 4 -type f -iname 'BeraTalk*.zip' ! -name 'BeraTalk-AI-Spark-UXFIX-source.zip' -print | sort -Vr >> "$ZIP_CANDIDATES_FILE"
+
+            while IFS= read -r zip_file; do
+              [[ -n "$zip_file" ]] || continue
+              candidate_extract="$EXTRACT_ROOT/$(basename "$zip_file" .zip)"
+              mkdir -p "$candidate_extract"
+              if ! unzip -q "$zip_file" -d "$candidate_extract"; then
+                rm -rf "$candidate_extract"
+                continue
+              fi
+
+              while IFS= read -r settings_file; do
+                [[ -n "$settings_file" ]] || continue
+                candidate_dir="$(dirname "$settings_file")"
+                if is_beratalk_project "$candidate_dir"; then
+                  PROJECT_DIR="$(cd "$candidate_dir" && pwd)"
+                  echo "Using BeraTalk source ZIP: $zip_file"
+                  echo "Detected Android project: $PROJECT_DIR"
+                  break 2
+                fi
+              done < <(find "$candidate_extract" -maxdepth 8 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print | sort)
+            done < "$ZIP_CANDIDATES_FILE"
+          fi
+
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "ERROR: Could not find an Android project whose app package is com.beratalk.app."
+            echo "Repository files:"
+            find . -maxdepth 4 -type f | sort | head -n 250
+            exit 1
+          fi
+
+          test -f "$PROJECT_DIR/settings.gradle.kts" -o -f "$PROJECT_DIR/settings.gradle"
+          test -f "$PROJECT_DIR/app/build.gradle.kts" -o -f "$PROJECT_DIR/app/build.gradle"
+          test -f "$PROJECT_DIR/app/google-services.json" || { echo "ERROR: app/google-services.json is missing."; exit 1; }
+          test -f "$PROJECT_DIR/signing/beratalk-release.jks" || { echo "ERROR: BeraTalk release keystore is missing."; exit 1; }
+          test -f "$PROJECT_DIR/signing/keystore.properties" || { echo "ERROR: signing/keystore.properties is missing."; exit 1; }
+
+          grep -q '"package_name": "com.beratalk.app"' "$PROJECT_DIR/app/google-services.json" || {
+            echo "ERROR: google-services.json does not target com.beratalk.app."
+            exit 1
+          }
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Verify BeraTalk UX safeguards
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          MAIN="$PROJECT_DIR/app/src/main/java/com/beratalk/app/MainActivity.kt"
+          THEME="$PROJECT_DIR/app/src/main/java/com/beratalk/app/ui/theme/Theme.kt"
+          BUILD="$PROJECT_DIR/app/build.gradle.kts"
+
+          grep -q 'compileSdk = 36' "$BUILD"
+          grep -q 'targetSdk = 36' "$BUILD"
+          grep -q 'versionCode = 4' "$BUILD"
+          grep -q 'SetupStepCard' "$MAIN" || { echo "ERROR: progressive onboarding missing."; exit 1; }
+          grep -q 'AnimatedContent(targetState = step' "$MAIN" || { echo "ERROR: step-by-step onboarding animation missing."; exit 1; }
+          grep -q 'NextUpPanel' "$MAIN" || { echo "ERROR: consolidated Home action panel missing."; exit 1; }
+          grep -q 'SharedProgressCard' "$MAIN" || { echo "ERROR: consolidated progress layout missing."; exit 1; }
+          grep -q 'beratalk_app_icon_reference' "$MAIN" || { echo "ERROR: branded chat header icon missing."; exit 1; }
+          grep -q 'val Ink = Color(0xFF111315)' "$THEME" || { echo "ERROR: high-contrast text token changed unexpectedly."; exit 1; }
+          grep -q 'val Muted = Color(0xFF626970)' "$THEME" || { echo "ERROR: readable secondary text token changed unexpectedly."; exit 1; }
+
+          if grep -q 'Text("❤️"' "$MAIN"; then
+            echo "ERROR: placeholder emoji branding has returned."
+            exit 1
+          fi
+
+      - name: Verify update signing certificate
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          STORE_PASS="$(grep '^storePassword=' "$PROJECT_DIR/signing/keystore.properties" | cut -d= -f2-)"
+          ALIAS="$(grep '^keyAlias=' "$PROJECT_DIR/signing/keystore.properties" | cut -d= -f2-)"
+          keytool -list -v \
+            -keystore "$PROJECT_DIR/signing/beratalk-release.jks" \
+            -storepass "$STORE_PASS" \
+            -alias "$ALIAS" | grep -E 'SHA1:|SHA256:'
+
+      - name: Build signed release APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          # Critical: build from the Android project directory, not the GitHub repository root.
+          gradle --no-daemon -p "$PROJECT_DIR" :app:assembleRelease --stacktrace
+
+      - name: Stage signed APK
+        id: apk
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK" || { echo "ERROR: Signed release APK not found at $APK"; exit 1; }
+          OUT="$RUNNER_TEMP/BeraTalk-1.0.3-ux-signed.apk"
+          cp "$APK" "$OUT"
+          sha256sum "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed BeraTalk APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeraTalk-1.0.3-ux-signed
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
