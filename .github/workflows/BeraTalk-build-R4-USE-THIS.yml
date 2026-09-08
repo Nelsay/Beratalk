@@ -1,0 +1,251 @@
+name: BeraTalk Build R4 — ZIP SAFE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Confirm BeraTalk workflow revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "BeraTalk workflow revision: 2026-09-08-R4"
+          echo "Expected package: com.beratalk.app"
+          echo "Preferred source: BeraTalk-AI-Spark-UXFIX-source.zip"
+          echo "This workflow MUST show a 'Locate BeraTalk Android project' step before Gradle build."
+
+      - name: Locate BeraTalk Android project
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_beratalk_project() {
+            local dir="$1"
+            local app_gradle=""
+            if [[ -f "$dir/app/build.gradle.kts" ]]; then
+              app_gradle="$dir/app/build.gradle.kts"
+            elif [[ -f "$dir/app/build.gradle" ]]; then
+              app_gradle="$dir/app/build.gradle"
+            else
+              return 1
+            fi
+            grep -Eq 'applicationId\s*=\s*"com\.beratalk\.app"|applicationId\s+"com\.beratalk\.app"' "$app_gradle"
+          }
+
+          PROJECT_DIR=""
+          SOURCE_DESC=""
+
+          # 1) Accept an already-extracted BeraTalk project.
+          while IFS= read -r settings_file; do
+            [[ -n "$settings_file" ]] || continue
+            candidate_dir="$(cd "$(dirname "$settings_file")" && pwd)"
+            if is_beratalk_project "$candidate_dir"; then
+              PROJECT_DIR="$candidate_dir"
+              SOURCE_DESC="extracted project"
+              break
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -maxdepth 7 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print | sort)
+
+          # 2) Otherwise inspect the preferred source ZIP first, then other BeraTalk ZIPs.
+          if [[ -z "$PROJECT_DIR" ]]; then
+            EXTRACT_ROOT="$RUNNER_TEMP/beratalk-source"
+            rm -rf "$EXTRACT_ROOT"
+            mkdir -p "$EXTRACT_ROOT"
+
+            CANDIDATES="$RUNNER_TEMP/beratalk-zip-candidates.txt"
+            : > "$CANDIDATES"
+
+            PREFERRED="$GITHUB_WORKSPACE/BeraTalk-AI-Spark-UXFIX-source.zip"
+            if [[ -f "$PREFERRED" ]]; then
+              printf '%s\n' "$PREFERRED" >> "$CANDIDATES"
+            fi
+
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -iname 'BeraTalk*.zip' \
+              ! -path "$PREFERRED" -print | sort -Vr >> "$CANDIDATES"
+
+            while IFS= read -r zip_file; do
+              [[ -n "$zip_file" ]] || continue
+              echo "Inspecting source archive: $zip_file"
+              candidate_extract="$EXTRACT_ROOT/$(basename "$zip_file" .zip)"
+              rm -rf "$candidate_extract"
+              mkdir -p "$candidate_extract"
+
+              unzip -q "$zip_file" -d "$candidate_extract" || {
+                echo "Skipping unreadable ZIP: $zip_file"
+                continue
+              }
+
+              while IFS= read -r settings_file; do
+                [[ -n "$settings_file" ]] || continue
+                candidate_dir="$(cd "$(dirname "$settings_file")" && pwd)"
+                if is_beratalk_project "$candidate_dir"; then
+                  PROJECT_DIR="$candidate_dir"
+                  SOURCE_DESC="ZIP $(basename "$zip_file")"
+                  break 2
+                fi
+              done < <(find "$candidate_extract" -maxdepth 9 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print | sort)
+            done < "$CANDIDATES"
+          fi
+
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "ERROR: No Android project for package com.beratalk.app was found."
+            echo "Repository files:"
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f | sort | head -n 300
+            exit 1
+          fi
+
+          echo "Using BeraTalk source: $SOURCE_DESC"
+          echo "Android project root: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+          test -f "$PROJECT_DIR/settings.gradle.kts" -o -f "$PROJECT_DIR/settings.gradle"
+          test -f "$PROJECT_DIR/app/build.gradle.kts" -o -f "$PROJECT_DIR/app/build.gradle"
+          test -s "$PROJECT_DIR/app/google-services.json" || {
+            echo "ERROR: app/google-services.json is missing."
+            exit 1
+          }
+          test -s "$PROJECT_DIR/signing/beratalk-release.jks" || {
+            echo "ERROR: signing/beratalk-release.jks is missing."
+            exit 1
+          }
+          test -s "$PROJECT_DIR/signing/keystore.properties" || {
+            echo "ERROR: signing/keystore.properties is missing."
+            exit 1
+          }
+
+          grep -q '"package_name": "com.beratalk.app"' "$PROJECT_DIR/app/google-services.json" || {
+            echo "ERROR: Firebase config does not target com.beratalk.app."
+            exit 1
+          }
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android API 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.6
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.6.0"
+          cache-provider: basic
+
+      - name: Verify build stack and BeraTalk source
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          ROOT_BUILD="$PROJECT_DIR/build.gradle.kts"
+          APP_BUILD="$PROJECT_DIR/app/build.gradle.kts"
+          MAIN="$PROJECT_DIR/app/src/main/java/com/beratalk/app/MainActivity.kt"
+          THEME="$PROJECT_DIR/app/src/main/java/com/beratalk/app/ui/theme/Theme.kt"
+
+          grep -q 'com.android.application") version "9.4.0"' "$ROOT_BUILD" || {
+            echo "ERROR: Expected AGP 9.4.0."
+            exit 1
+          }
+          grep -q 'org.jetbrains.kotlin.android") version "2.3.21"' "$ROOT_BUILD" || {
+            echo "ERROR: Expected Kotlin 2.3.21."
+            exit 1
+          }
+          grep -q 'compileSdk = 36' "$APP_BUILD" || {
+            echo "ERROR: compileSdk must be 36."
+            exit 1
+          }
+          grep -q 'targetSdk = 36' "$APP_BUILD" || {
+            echo "ERROR: targetSdk must be 36."
+            exit 1
+          }
+          grep -q 'applicationId = "com.beratalk.app"' "$APP_BUILD" || {
+            echo "ERROR: BeraTalk applicationId changed."
+            exit 1
+          }
+
+          # Keep the UX fixes from the Prepwise/Bera audit from regressing.
+          grep -q 'SetupStepCard' "$MAIN" || { echo "ERROR: progressive onboarding missing."; exit 1; }
+          grep -q 'AnimatedContent(targetState = step' "$MAIN" || { echo "ERROR: onboarding motion missing."; exit 1; }
+          grep -q 'NextUpPanel' "$MAIN" || { echo "ERROR: consolidated Home panel missing."; exit 1; }
+          grep -q 'SharedProgressCard' "$MAIN" || { echo "ERROR: consolidated progress panel missing."; exit 1; }
+          grep -q 'val Ink = Color(0xFF111315)' "$THEME" || { echo "ERROR: high-contrast Ink token changed."; exit 1; }
+          grep -q 'val Muted = Color(0xFF626970)' "$THEME" || { echo "ERROR: readable Muted token changed."; exit 1; }
+
+          echo "BeraTalk source and UX safeguards verified."
+
+      - name: Verify update signing certificate
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          STORE_PASS="$(grep '^storePassword=' "$PROJECT_DIR/signing/keystore.properties" | cut -d= -f2-)"
+          ALIAS="$(grep '^keyAlias=' "$PROJECT_DIR/signing/keystore.properties" | cut -d= -f2-)"
+          keytool -list -v \
+            -keystore "$PROJECT_DIR/signing/beratalk-release.jks" \
+            -storepass "$STORE_PASS" \
+            -alias "$ALIAS" | grep -E 'SHA1:|SHA256:'
+
+      - name: Build signed BeraTalk release APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          echo "Building from: $PROJECT_DIR"
+          test -f "$PROJECT_DIR/settings.gradle.kts" -o -f "$PROJECT_DIR/settings.gradle"
+          gradle --no-daemon --stacktrace -p "$PROJECT_DIR" :app:assembleRelease
+
+      - name: Verify and stage signed APK
+        id: apk
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/release" -maxdepth 1 -type f -name '*.apk' | sort | head -n 1)"
+          if [[ -z "${APK:-}" || ! -f "$APK" ]]; then
+            echo "ERROR: Gradle completed without a release APK."
+            find "$PROJECT_DIR/app/build/outputs" -maxdepth 5 -type f 2>/dev/null | sort || true
+            exit 1
+          fi
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+
+          OUT="$RUNNER_TEMP/BeraTalk-1.0.3-ux-signed.apk"
+          cp "$APK" "$OUT"
+          sha256sum "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed BeraTalk APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeraTalk-1.0.3-ux-signed
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
